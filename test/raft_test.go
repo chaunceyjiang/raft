@@ -1,6 +1,6 @@
 // Eli Bendersky [https://eli.thegreenplace.net]
 // This code is in the public domain.
-package raft
+package test
 
 import (
 	"testing"
@@ -23,7 +23,7 @@ func TestElectionLeaderDisconnect(t *testing.T) {
 	origLeaderId, origTerm := h.CheckSingleLeader()
 
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(350)
+	SleepMs(350)
 
 	newLeaderId, newTerm := h.CheckSingleLeader()
 	if newLeaderId == origLeaderId {
@@ -45,7 +45,7 @@ func TestElectionLeaderAndAnotherDisconnect(t *testing.T) {
 	h.DisconnectPeer(otherId)
 
 	// No quorum.
-	sleepMs(450)
+	SleepMs(450)
 	h.CheckNoLeader()
 
 	// Reconnect one other server; now we'll have quorum.
@@ -57,16 +57,16 @@ func TestDisconnectAllThenRestore(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
-	sleepMs(100)
+	SleepMs(100)
 	//	Disconnect all servers from the start. There will be no leader.
-	for i := 0; i < 3; i++ {
+	for i := int(0); i < 3; i++ {
 		h.DisconnectPeer(i)
 	}
-	sleepMs(450)
+	SleepMs(450)
 	h.CheckNoLeader()
 
 	// Reconnect all servers. A leader will be found.
-	for i := 0; i < 3; i++ {
+	for i := int(0); i < 3; i++ {
 		h.ReconnectPeer(i)
 	}
 	h.CheckSingleLeader()
@@ -79,11 +79,11 @@ func TestElectionLeaderDisconnectThenReconnect(t *testing.T) {
 
 	h.DisconnectPeer(origLeaderId)
 
-	sleepMs(350)
+	SleepMs(350)
 	newLeaderId, newTerm := h.CheckSingleLeader()
 
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(150)
+	SleepMs(150)
 
 	againLeaderId, againTerm := h.CheckSingleLeader()
 
@@ -104,11 +104,11 @@ func TestElectionLeaderDisconnectThenReconnect5(t *testing.T) {
 	origLeaderId, _ := h.CheckSingleLeader()
 
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(150)
+	SleepMs(150)
 	newLeaderId, newTerm := h.CheckSingleLeader()
 
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(150)
+	SleepMs(150)
 
 	againLeaderId, againTerm := h.CheckSingleLeader()
 
@@ -132,7 +132,7 @@ func TestElectionFollowerComesBack(t *testing.T) {
 	h.DisconnectPeer(otherId)
 	time.Sleep(650 * time.Millisecond)
 	h.ReconnectPeer(otherId)
-	sleepMs(150)
+	SleepMs(250)
 
 	// We can't have an assertion on the new leader id here because it depends
 	// on the relative election timeouts. We can assert that the term changed,
@@ -155,7 +155,7 @@ func TestElectionDisconnectLoop(t *testing.T) {
 		h.DisconnectPeer(leaderId)
 		otherId := (leaderId + 1) % 3
 		h.DisconnectPeer(otherId)
-		sleepMs(310)
+		SleepMs(310)
 		h.CheckNoLeader()
 
 		// Reconnect both.
@@ -163,6 +163,6 @@ func TestElectionDisconnectLoop(t *testing.T) {
 		h.ReconnectPeer(leaderId)
 
 		// Give it time to settle
-		sleepMs(150)
+		SleepMs(150)
 	}
 }
