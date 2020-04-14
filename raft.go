@@ -10,12 +10,12 @@ import (
 	"time"
 )
 
-var DebugCM = 0
+var DebugCM = 2
 
 // raft 协议实现
 
 // 角色类型
-type StateType uint64
+type StateType int
 
 const (
 	Follower StateType = iota
@@ -41,9 +41,9 @@ type ConsensusModule struct {
 	// 必备条件
 	mu sync.Mutex
 
-	id uint64 // 节点id
+	id int // 节点id
 
-	peerIds []uint64 // 整个集群的其他端点id
+	peerIds []int // 整个集群的其他端点id
 
 	state StateType //角色
 
@@ -52,20 +52,20 @@ type ConsensusModule struct {
 
 	// 论文描述
 	// Persistent Raft state on all servers
-	currentTerm uint64     // 当前任期
-	voteFor     uint64     // 投票标记
+	currentTerm int        // 当前任期
+	voteFor     int        // 投票标记
 	log         []LogEntry // 日志
 
 	// 论文描述
 	// Volatile Raft state on all servers
-	commitIndex uint64
-	lastApplied uint64
+	commitIndex int
+	lastApplied int
 
 	// 论文描述
 	// Volatile Raft state on leaders
 	// 这两个数组只对 Leader 有用
-	nextIndex  map[uint64]uint64 // 保存要发送给每一个Follower的下一个日志条目
-	matchIndex map[uint64]uint64 // 跟踪Leader和每个Follower匹配到的日志条目
+	nextIndex  map[int]int // 保存要发送给每一个Follower的下一个日志条目
+	matchIndex map[int]int // 跟踪Leader和每个Follower匹配到的日志条目
 
 	// 各种计时器
 	// 选举超时
@@ -74,22 +74,23 @@ type ConsensusModule struct {
 	HeartbeatTimeDuration time.Duration
 }
 
-const None uint64 = 0
+const None int = -1
 
-func NewConsensusModule(id uint64, peerIds []uint64, server *Server, ready <-chan interface{}) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}) *ConsensusModule {
 	cm := &ConsensusModule{
-		mu:          sync.Mutex{},
-		id:          0,
-		peerIds:     peerIds,
-		state:       Follower,
-		server:      server,
-		currentTerm: 0,    // 根据论文，初始化 0
-		voteFor:     None, //根据论文 初始化 None
+		mu:                    sync.Mutex{},
+		id:                    id,
+		peerIds:               peerIds,
+		state:                 Follower,
+		server:                server,
+		currentTerm:           0,    // 根据论文，初始化 0
+		voteFor:               None, //根据论文 初始化 None
+		HeartbeatTimeDuration: 50 * time.Millisecond,
 	}
 	go func() {
 		// 接收到一个ready信号，则选举计时器开始
 		<-ready
-
+		cm.debugLog("初始计时器开始计时")
 		cm.mu.Lock()
 		cm.electionTime = time.Now()
 		cm.mu.Unlock()
@@ -107,6 +108,19 @@ func (cm *ConsensusModule) debugLog(format string, args ...interface{}) {
 	}
 }
 
+func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.id, cm.currentTerm, cm.state == Leader
+}
+
+func (cm *ConsensusModule) Stop() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.state = Dead
+	cm.debugLog("becomes Dead")
+}
+
 // electionTimeout 生成一个随机时间
 // 论文描述该时间为 150ms-300ms
 func (cm *ConsensusModule) electionTimeout() time.Duration {
@@ -121,7 +135,7 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 func (cm *ConsensusModule) runElectionTimer() {
 	// 生成一个选举超时时间
 	timeoutDuration := cm.electionTimeout()
-
+	cm.debugLog("获得一个超时时间 %+v", cm.id, timeoutDuration)
 	cm.mu.Lock()
 	termStarted := cm.currentTerm // 记录选举计时器开始的任期，当计时器发现任期变化时，计时器退出
 	cm.mu.Unlock()
@@ -129,6 +143,9 @@ func (cm *ConsensusModule) runElectionTimer() {
 	// 这里每5毫秒检查一次
 	//
 	ticker := time.NewTicker(5 * time.Millisecond)
+	defer func() {
+		cm.debugLog("选举计时器退出", cm.id)
+	}()
 	defer ticker.Stop()
 	for {
 		<-ticker.C
@@ -173,19 +190,19 @@ func (cm *ConsensusModule) startElection() {
 
 	for _, peerId := range cm.peerIds {
 		// 并发的发起 RequestVote RPC
-		go func(peerId uint64) {
+		go func(peerId int) {
 			args := RequestVoteArgs{
 				Term:        savedCurrentTerm,
 				CandidateId: cm.id,
 			}
 			var reply RequestVoteReply
-			cm.debugLog("sending RequestVote to %d: %+v", peerId, args)
+			cm.debugLog("发送 RequestVote to %d: %+v", peerId, args)
 			// 发起一个RPC Call
 			if err := cm.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				// 统计活的的投票个数
 				cm.mu.Lock() //阻塞
 				defer cm.mu.Unlock()
-				cm.debugLog("received RequestVoteReply %+v", reply)
+				cm.debugLog("接收 RequestVoteReply %+v", reply)
 
 				if cm.state != Candidate {
 					// 在RPC期间 自己的角色已经发生了改变
@@ -210,6 +227,7 @@ func (cm *ConsensusModule) startElection() {
 							cm.debugLog("id %d wins election with %d votes", cm.id, votes)
 							cm.becomeLeader()
 						}
+						cm.debugLog("获得的投票数 %v", votes)
 					}
 				}
 			}
@@ -220,7 +238,7 @@ func (cm *ConsensusModule) startElection() {
 }
 
 // 变成追随者
-func (cm *ConsensusModule) becomeFollower(term uint64) {
+func (cm *ConsensusModule) becomeFollower(term int) {
 	// 依赖函数外部锁
 	cm.debugLog("becomes Follower with term=%d; log=%v", term, cm.log)
 	cm.state = Follower
@@ -269,13 +287,13 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 			Term:     savedCurrentTerm,
 			LeaderId: cm.id,
 		}
-		go func(peerId uint64) {
-			cm.debugLog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
+		go func(peerId int) {
+			cm.debugLog("发送 AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-
+				cm.debugLog("收到的任期 %d",reply.Term)
 				if reply.Term > savedCurrentTerm {
 					// 心跳信息中的任期大于当前任期,则变为跟随者
 					cm.debugLog("term out of date in heartbeat reply")
@@ -345,6 +363,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		cm.electionTime = time.Now() // 更新选举计时器
 		reply.Success = true         // 更新成功
 	}
+	reply.Term = cm.currentTerm
 	cm.debugLog("AppendEntries reply: %+v", *reply)
 	return nil
 }
