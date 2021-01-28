@@ -135,17 +135,14 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 func (cm *ConsensusModule) runElectionTimer() {
 	// 生成一个选举超时时间
 	timeoutDuration := cm.electionTimeout()
-	cm.debugLog("获得一个超时时间 %+v", cm.id, timeoutDuration)
 	cm.mu.Lock()
+	cm.debugLog("获得一个选举超时时间 %+v", cm.id, timeoutDuration)
 	termStarted := cm.currentTerm // 记录选举计时器开始的任期，当计时器发现任期变化时，计时器退出
 	cm.mu.Unlock()
 
 	// 这里每5毫秒检查一次
 	//
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer func() {
-		cm.debugLog("选举计时器退出", cm.id)
-	}()
+	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		<-ticker.C
@@ -154,16 +151,19 @@ func (cm *ConsensusModule) runElectionTimer() {
 			// 不是候选者，也不是跟随者
 			//  因此选举计时器，不需要
 			cm.mu.Unlock()
+			cm.debugLog("选举计时器退出 state ", cm.state)
 			return // 选举计时器退出
 		}
 
 		if termStarted != cm.currentTerm {
 			// 在选举计时器，及时期间，任期发生变化
 			cm.mu.Unlock()
+			cm.debugLog("选举计时器退出 currentTerm %d termStarted %d ", cm.currentTerm,termStarted)
 			return
 		}
-
+		// 每一次心跳Follower 收到心跳信息都会刷新electionTime,如果长时间没有收到心跳信息,自己就会开始进入下一任的选举.
 		if elapsed := time.Since(cm.electionTime); elapsed >= timeoutDuration {
+			cm.debugLog("选举计时 electionTime %v elapsed %v timeoutDuration %v ", cm.electionTime,elapsed,timeoutDuration)
 			// 选举超时
 			// 开始进行选举
 			cm.startElection()
@@ -185,8 +185,8 @@ func (cm *ConsensusModule) startElection() {
 	cm.voteFor = cm.id           // 将票投给自己
 	cm.debugLog("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
 
-	// 统计的自己收到的投票个数
-	var votesCount uint32
+	// 统计的自己收到的投票个数,自己给自己投了一票
+	var votesCount uint32=1
 
 	for _, peerId := range cm.peerIds {
 		// 并发的发起 RequestVote RPC
@@ -210,14 +210,13 @@ func (cm *ConsensusModule) startElection() {
 				}
 
 				if reply.Term > savedCurrentTerm {
+					cm.debugLog("接收到一个任期大于自己的投票,直接变为Follower %+v", reply)
 					// 如果回复的任期大于自己的任期，表示有新的已经开始了，新的一轮，一次自己直接变成跟随者
 					cm.becomeFollower(reply.Term)
 					// 这里有一个隐藏
 					// 当接收到别自己到的任期后，变成跟随者时，上一个任期的选举计时器也会失效
 					return
-				}
-
-				if reply.Term == savedCurrentTerm {
+				}else if reply.Term == savedCurrentTerm {
 					if reply.VoteGranted {
 						// 任期是自己所在的任期，且有投票给自己
 						votes := atomic.AddUint32(&votesCount, 1) //个数加一
@@ -226,6 +225,8 @@ func (cm *ConsensusModule) startElection() {
 							// 变成领导者，选举计时器会退出
 							cm.debugLog("id %d wins election with %d votes", cm.id, votes)
 							cm.becomeLeader()
+							// 这里变成领导者后，直接退出，不在进行，下面的选举计时器
+							return
 						}
 						cm.debugLog("获得的投票数 %v", votes)
 					}
@@ -264,6 +265,7 @@ func (cm *ConsensusModule) becomeLeader() {
 			cm.leaderSendHeartbeats()
 			<-ticker.C
 			cm.mu.Lock()
+			// 心跳信息只能由领导者发出,因此,每一轮心跳都要检查自己的身份
 			if cm.state != Leader {
 				// 直到不是领导者，退出
 				cm.mu.Unlock()
@@ -279,7 +281,7 @@ func (cm *ConsensusModule) becomeLeader() {
 func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Lock()
 	savedCurrentTerm := cm.currentTerm
-	cm.mu.Lock()
+	cm.mu.Unlock()
 
 	for _, peerId := range cm.peerIds {
 		// 论文中说明，如果日志追加是空，则表示为心跳信息
