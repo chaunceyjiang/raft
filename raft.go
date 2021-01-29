@@ -64,7 +64,8 @@ type ConsensusModule struct {
 	// 论文描述
 	// Volatile Raft state on leaders
 	// 这两个数组只对 Leader 有用
-	nextIndex  map[int]int // 保存要发送给每一个Follower的下一个日志条目
+	// 领导人针对每一个跟随者维护了一个 nextIndex，这表示下一个需要发送给跟随者的日志条目的索引地址。当一个领导人刚获得权力的时候，他初始化所有的 nextIndex 值为自己的最后一条日志的 index 加 1
+	nextIndex  map[int]int // 保存要发送给每一个Follower的下一个日志条目,论文5.3
 	matchIndex map[int]int // 跟踪Leader和每个Follower匹配到的日志条目
 
 	// 各种计时器
@@ -72,6 +73,9 @@ type ConsensusModule struct {
 	electionTime time.Time
 	// 心跳
 	HeartbeatTimeDuration time.Duration
+
+	// 与客户端进行通信
+	newCommitReadyChan chan struct{}
 }
 
 const None int = -1
@@ -158,12 +162,12 @@ func (cm *ConsensusModule) runElectionTimer() {
 		if termStarted != cm.currentTerm {
 			// 在选举计时器，及时期间，任期发生变化
 			cm.mu.Unlock()
-			cm.debugLog("选举计时器退出 currentTerm %d termStarted %d ", cm.currentTerm,termStarted)
+			cm.debugLog("选举计时器退出 currentTerm %d termStarted %d ", cm.currentTerm, termStarted)
 			return
 		}
 		// 每一次心跳Follower 收到心跳信息都会刷新electionTime,如果长时间没有收到心跳信息,自己就会开始进入下一任的选举.
 		if elapsed := time.Since(cm.electionTime); elapsed >= timeoutDuration {
-			cm.debugLog("选举计时 electionTime %v elapsed %v timeoutDuration %v ", cm.electionTime,elapsed,timeoutDuration)
+			cm.debugLog("选举计时 electionTime %v elapsed %v timeoutDuration %v ", cm.electionTime, elapsed, timeoutDuration)
 			// 选举超时
 			// 开始进行选举
 			cm.startElection()
@@ -186,7 +190,7 @@ func (cm *ConsensusModule) startElection() {
 	cm.debugLog("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
 
 	// 统计的自己收到的投票个数,自己给自己投了一票
-	var votesCount uint32=1
+	var votesCount uint32 = 1
 
 	for _, peerId := range cm.peerIds {
 		// 并发的发起 RequestVote RPC
@@ -216,7 +220,7 @@ func (cm *ConsensusModule) startElection() {
 					// 这里有一个隐藏
 					// 当接收到别自己到的任期后，变成跟随者时，上一个任期的选举计时器也会失效
 					return
-				}else if reply.Term == savedCurrentTerm {
+				} else if reply.Term == savedCurrentTerm {
 					if reply.VoteGranted {
 						// 任期是自己所在的任期，且有投票给自己
 						votes := atomic.AddUint32(&votesCount, 1) //个数加一
@@ -277,25 +281,43 @@ func (cm *ConsensusModule) becomeLeader() {
 }
 
 // leaderSendHeartbeats 将心跳信息发送给所有的节点，收集他们的回复信息
-// 论文中 信息信息跟日志追加相同
+// 论文中 心跳信息跟日志追加相同
 func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Lock()
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
 
 	for _, peerId := range cm.peerIds {
-		// 论文中说明，如果日志追加是空，则表示为心跳信息
-		args := AppendEntriesArgs{
-			Term:     savedCurrentTerm,
-			LeaderId: cm.id,
-		}
+
 		go func(peerId int) {
+			// 论文中说明，如果日志追加是空，则表示为心跳信息
+			cm.mu.Lock()
+			nextIndex := cm.nextIndex[peerId]
+			// 刚获得Leader时 自身logIndex + 1
+			prevLogIndex := nextIndex - 1 //紧邻新日志条目之前的那个日志条目的索引
+			prevLogTerm := None           //紧邻新日志条目之前的那个日志条目的任期
+			if prevLogIndex >= 0 {
+				prevLogTerm = cm.log[prevLogIndex].Term
+			}
+			// 将没有同步newLogEntries日志,同步给Follower
+			newLogEntries := cm.log[nextIndex:]
+			// 当newLogEntries 为空时,为心跳信息
+
+			args := AppendEntriesArgs{
+				Term:         savedCurrentTerm,
+				LeaderId:     cm.id,
+				Entries:      newLogEntries,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				LeaderCommit: cm.commitIndex, //领导者的已知已提交的最高的日志条目的索引
+			}
+			cm.mu.Unlock()
 			cm.debugLog("发送 AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				cm.debugLog("收到的任期 %d",reply.Term)
+				cm.debugLog("收到的任期 %d", reply.Term)
 				if reply.Term > savedCurrentTerm {
 					// 心跳信息中的任期大于当前任期,则变为跟随者
 					cm.debugLog("term out of date in heartbeat reply")
@@ -303,6 +325,51 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 					// 同时 心跳计时器退出
 					return
 				}
+
+				//在被跟随者拒绝之后，领导人就会减小 nextIndex 值并进行重试。最终 nextIndex 会在某个位置使得领导人和跟随者的日志达成一致。
+				//当这种情况发生，附加日志 RPC 就会成功，这时就会把跟随者冲突的日志条目全部删除并且加上领导人的日志。
+				//一旦附加日志 RPC 成功，那么跟随者的日志就会和领导人保持一致，并且在接下来的任期里一直继续保持。
+				if cm.state == Leader && savedCurrentTerm == reply.Term {
+					// savedCurrentTerm == reply.Term  确保回复的当前任期的请求
+					if reply.Success {
+						// 对于每一台服务器，发送到该服务器的下一个日志条目的索引
+						cm.nextIndex[peerId] = nextIndex + len(newLogEntries)
+						// matchIndex 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引
+						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
+
+						// 统计相应成功的个数,如果日志被大多数应用,这Leader 更新commitIndex ,表示这一条日志被永久应用到状态机
+						savedCommitIndex := cm.commitIndex
+
+						for i := cm.commitIndex; i < len(cm.log); i++ {
+							// 从上一此应用到日志的索引开始统计
+							// 5.4.2 如果一个新的领导人要重新复制之前的任期里的日志时，它必须使用当前新的任期号
+							if cm.log[i].Term == cm.currentTerm {
+								matchCount := 1 // 自己有一票
+								for _, peerId := range cm.peerIds {
+									if cm.matchIndex[peerId] >= i {
+										matchCount++
+									}
+								}
+								// 如果 第 i 条日志 ,被大多数matchCount*2>len(cm.peerIds)+1 节点commit ,则 该 日志被应用
+								if matchCount*2 > len(cm.peerIds)+1 {
+									cm.commitIndex = i
+								}
+							}
+						}
+						if cm.commitIndex > savedCommitIndex {
+							// 表示有新的日志被应用,则通知客户端
+							cm.debugLog("有新的日志被应用到状态机.. ", cm.commitIndex)
+							cm.newCommitReadyChan <- struct{}{}
+						}
+					} else {
+						// 被跟随者拒绝之后，领导人就会减小 nextIndex 值并进行重试。最终 nextIndex 会在某个位置使得领导人和跟随者的日志达成一致。
+						cm.nextIndex[peerId] = nextIndex - 1
+						cm.debugLog(" 日志被跟随者拒绝, nextIndex 向前移动 nextIndex %d --> %d ", nextIndex, nextIndex-1)
+					}
+				} else {
+					cm.debugLog("在 AppendEntries RPC 期间,角色已经发生了变化....")
+				}
+
 			}
 		}(peerId)
 	}
@@ -315,17 +382,24 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	if cm.state == Dead {
 		return nil
 	}
+	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
 	cm.debugLog("RequestVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.voteFor)
 	// 开始投票
 	if args.Term > cm.currentTerm {
 		// 论文实现
 		// 收到的投票请求中的任期大于自己的任期，自己变为追随者
+		//论文5.4.1 除了比较任期,还需要比较日志大小
 		cm.debugLog("... term out of date in RequestVote")
 		cm.becomeFollower(args.Term)
 	}
-
+	// 论文5.4.1 选举限制
+	//除了比较任期,还需要比较日志大小
+	// 能够投票的判断依据
+	// 请求的任期大于自己的任期
+	// 需要比较日志大小
 	canVote := args.Term == cm.currentTerm &&
-		(cm.voteFor == None || cm.voteFor == args.CandidateId)
+		(cm.voteFor == None || cm.voteFor == args.CandidateId) && ((args.LastLogTerm == lastLogTerm && args.LastLogIndex > lastLogIndex) || args.LastLogTerm > lastLogTerm)
+
 	// 论文实现
 	if canVote {
 		// 可以正常投票
@@ -363,9 +437,76 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			cm.becomeFollower(args.Term)
 		}
 		cm.electionTime = time.Now() // 更新选举计时器
-		reply.Success = true         // 更新成功
+		/*
+		      接收者的实现：
+		   	返回假 如果领导者的任期 小于 接收者的当前任期（译者注：这里的接收者是指跟随者或者候选者）（5.1 节）
+		      返回假 如果接收者日志中没有包含这样一个条目 即该条目的任期在preLogIndex上能和prevLogTerm匹配上 （译者注：在接收者日志中 如果能找到一个和preLogIndex以及prevLogTerm一样的索引和任期的日志条目 则返回真 否则返回假）（5.3 节）
+		      如果一个已经存在的条目和新条目（译者注：即刚刚接收到的日志条目）发生了冲突（因为索引相同，任期不同），那么就删除这个已经存在的条目以及它之后的所有条目 （5.3 节）
+		      追加日志中尚未存在的任何新条目
+		      如果领导者的已知已经提交的最高的日志条目的索引 大于 接收者的已知已经提交的最高的日志条目的索引
+		   则把 接收者的已知已经提交的最高的日志条目的索引 重置为 领导者的已知已经提交的最高的日志条目的索引 或者是 上一个新条目的索引 取两者的最小值
+
+		*/
+
+		// 日志的一致性检查
+		// raft 保持两个原则
+		//如果在不同的日志中的两个条目拥有相同的索引和任期号，那么他们存储了相同的指令。
+		//如果在不同的日志中的两个条目拥有相同的索引和任期号，那么他们之前的所有日志条目也全部相同。
+		if args.PrevLogIndex == None || (args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+
+			// 寻找到一个和preLogIndex以及prevLogTerm一样的索引和任期的日志条目
+
+
+			// TODO
+
+
+			// 如果领导者的已知已经提交的最高的日志条目的索引 大于 接收者的已知已经提交的最高的日志条目的索引
+			//则把 接收者的已知已经提交的最高的日志条目的索引 重置为 领导者的已知已经提交的最高的日志条目的索引 或者是 上一个新条目的索引 取两者的最小值
+			if args.LeaderCommit > cm.commitIndex {
+				cm.commitIndex = logMin(args.LeaderCommit,len(cm.log)-1)
+				cm.debugLog("应用新的日志到状态机 commitIndex",cm.commitIndex)
+				cm.newCommitReadyChan <- struct{}{}
+			}
+
+			reply.Success = true // 更新成功
+		}
+
 	}
 	reply.Term = cm.currentTerm
 	cm.debugLog("AppendEntries reply: %+v", *reply)
 	return nil
+}
+
+// lastLogIndexAndTerm 获取最新的日志索引和任期
+func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
+	if len(cm.log) > 0 {
+		lastIndex := len(cm.log) - 1
+		lastTerm := cm.log[lastIndex].Term
+		return lastIndex, lastTerm
+	}
+	return -1, -1
+}
+
+// 提交命令到log
+func (cm *ConsensusModule) Submit(command interface{}) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.debugLog("Submit received command ... %d %d ", cm.state, command)
+	if cm.state == Leader {
+		// 日志只能在Leader提交
+		cm.log = append(cm.log, LogEntry{
+			Command: command,
+			Term:    cm.currentTerm,
+		})
+		cm.debugLog("Leader log... %v ", cm.log)
+		return true
+	}
+	return false
+}
+
+func logMin(a, b int) int {
+	if a > b {
+		return b
+	}
+	return a
 }
