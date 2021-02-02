@@ -516,6 +516,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			}
 			if newEntriesIndex < len(args.Entries) {
 				// 表示至少还有一条日志是 Leader 跟Follower 是不一致的,此时追加日志,删除后面Follower后面不一致的日志
+				cm.debugLog("删除不匹配的日志  %v matchInsertIndex:%d newEntriesIndex:%d",cm.log[matchInsertIndex:],matchInsertIndex,newEntriesIndex)
 				cm.log = append(cm.log[:matchInsertIndex], args.Entries[newEntriesIndex:]...)
 			}
 			// 如果领导者的已知已经提交的最高的日志条目的索引 大于 接收者的已知已经提交的最高的日志条目的索引
