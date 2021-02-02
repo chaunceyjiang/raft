@@ -90,7 +90,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 		server:                server,
 		currentTerm:           0,    // 根据论文，初始化 0
 		voteFor:               None, //根据论文 初始化 None
-		HeartbeatTimeDuration: 50 * time.Millisecond,
+		HeartbeatTimeDuration: 30 * time.Millisecond,
 		nextIndex:             make(map[int]int),
 		matchIndex:            make(map[int]int),
 		lastApplied:           None,
@@ -109,6 +109,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 		cm.runElectionTimer()
 	}()
 	go cm.commitChanSender()
+	go cm.logReport()
 	return cm
 }
 
@@ -124,6 +125,22 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.id, cm.currentTerm, cm.state == Leader
+}
+func (cm *ConsensusModule) logReport() {
+	if DebugCM > 0 {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			cm.mu.Lock()
+			if cm.state == Dead {
+				break
+			}
+			cm.debugLog("%s all log %v", cm.state.String(), cm.log)
+			cm.mu.Unlock()
+			<-ticker.C
+		}
+	}
+
 }
 
 func (cm *ConsensusModule) Stop() {
@@ -149,7 +166,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	// 生成一个选举超时时间
 	timeoutDuration := cm.electionTimeout()
 	cm.mu.Lock()
-	cm.debugLog("获得一个选举超时时间 %v",timeoutDuration)
+	cm.debugLog("获得一个选举超时时间 %v", timeoutDuration)
 	termStarted := cm.currentTerm // 记录选举计时器开始的任期，当计时器发现任期变化时，计时器退出
 	cm.mu.Unlock()
 
@@ -204,9 +221,15 @@ func (cm *ConsensusModule) startElection() {
 	for _, peerId := range cm.peerIds {
 		// 并发的发起 RequestVote RPC
 		go func(peerId int) {
+			cm.mu.Lock()
+			//候选人负责调用用来征集选票（5.2 节）
+			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
+			cm.mu.Unlock()
 			args := RequestVoteArgs{
 				Term:        savedCurrentTerm,
 				CandidateId: cm.id,
+				LastLogTerm: savedLastLogTerm,//候选人最后日志条目的任期号
+				LastLogIndex: savedLastLogIndex,//候选人的最后日志条目的索引值
 			}
 			var reply RequestVoteReply
 			cm.debugLog("发送 RequestVote to %d: %+v", peerId, args)
@@ -330,10 +353,10 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				cm.debugLog("收到的任期 %d", reply.Term)
+				cm.debugLog("收到来自Follower的任期 %d", reply.Term)
 				if reply.Term > savedCurrentTerm {
 					// 心跳信息中的任期大于当前任期,则变为跟随者
-					cm.debugLog("term out of date in heartbeat reply")
+					cm.debugLog("RPC reply 消息中的Term 大于自己的Term ,自身由 %s ---> Follower", cm.state.String())
 					cm.becomeFollower(reply.Term)
 					// 同时 心跳计时器退出
 					return
@@ -371,8 +394,8 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 						}
 						if cm.commitIndex > savedCommitIndex {
 							// 表示有新的日志被应用,则通知客户端
-							cm.debugLog("Leader 有新的日志被应用到状态机.. ", cm.commitIndex)
-							cm.debugLog(" Leader all log %v",cm.log)
+							cm.debugLog("Leader 有新的日志被应用到状态机.. commitIndex %d", cm.commitIndex)
+							cm.debugLog(" Leader all log %v", cm.log)
 							cm.newCommitReadyChan <- struct{}{}
 						}
 					} else {
@@ -403,7 +426,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		// 论文实现
 		// 收到的投票请求中的任期大于自己的任期，自己变为追随者
 		//论文5.4.1 除了比较任期,还需要比较日志大小
-		cm.debugLog("... term out of date in RequestVote")
+		cm.debugLog("收到的投票请求中的任期大于自己的任期，自己变为追随者")
 		cm.becomeFollower(args.Term)
 	}
 	// 论文5.4.1 选举限制
@@ -412,15 +435,19 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	// 请求的任期大于自己的任期
 	// 需要比较日志大小
 	canVote := args.Term == cm.currentTerm &&
-		(cm.voteFor == None || cm.voteFor == args.CandidateId) && ((args.LastLogTerm == lastLogTerm && args.LastLogIndex > lastLogIndex) || args.LastLogTerm > lastLogTerm)
-
+		(cm.voteFor == None || cm.voteFor == args.CandidateId) &&
+		((args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) ||
+		args.LastLogTerm > lastLogTerm)
+	// (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) 索引是可以相同的,表示两边具有相同的日志
 	// 论文实现
 	if canVote {
 		// 可以正常投票
+		cm.debugLog("可以 %d 投票",args.CandidateId)
 		cm.voteFor = args.CandidateId // 投票
 		cm.electionTime = time.Now()  // 更新选举计时器
 		reply.VoteGranted = true      // 投票
 	} else {
+		cm.debugLog("不能对 %d 投票 ",args.CandidateId)
 		reply.VoteGranted = false // 不能正常投票
 	}
 
@@ -496,7 +523,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			if args.LeaderCommit > cm.commitIndex {
 				cm.commitIndex = logMin(args.LeaderCommit, len(cm.log)-1)
 				cm.debugLog("Follower 应用新的日志到状态机 commitIndex %d", cm.commitIndex)
-				cm.debugLog("Follower all log %v",cm.log)
+				cm.debugLog("Follower all log %v", cm.log)
 				cm.newCommitReadyChan <- struct{}{}
 			}
 

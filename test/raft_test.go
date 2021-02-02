@@ -96,7 +96,7 @@ func TestElectionLeaderDisconnectThenReconnect(t *testing.T) {
 }
 
 func TestElectionLeaderDisconnectThenReconnect5(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 1000*time.Millisecond)()
 
 	h := NewHarness(t, 5)
 	defer h.Shutdown()
@@ -121,7 +121,7 @@ func TestElectionLeaderDisconnectThenReconnect5(t *testing.T) {
 }
 
 func TestElectionFollowerComesBack(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 1000*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -144,7 +144,7 @@ func TestElectionFollowerComesBack(t *testing.T) {
 }
 
 func TestElectionDisconnectLoop(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 1000*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -170,7 +170,7 @@ func TestElectionDisconnectLoop(t *testing.T) {
 
 
 func TestCommitOneCommand(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 1000*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -202,7 +202,7 @@ func TestSubmitNonLeaderFails(t *testing.T) {
 }
 
 func TestCommitMultipleCommands(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 1000*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -236,7 +236,7 @@ func TestCommitMultipleCommands(t *testing.T) {
 }
 
 func TestCommitWithDisconnectionAndRecover(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 1000*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -267,7 +267,7 @@ func TestCommitWithDisconnectionAndRecover(t *testing.T) {
 }
 
 func TestNoCommitWithNoQuorum(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 1000*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -319,7 +319,7 @@ func TestNoCommitWithNoQuorum(t *testing.T) {
 }
 
 func TestCommitsWithLeaderDisconnects(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 1000*time.Millisecond)()
 
 	h := NewHarness(t, 5)
 	defer h.Shutdown()
