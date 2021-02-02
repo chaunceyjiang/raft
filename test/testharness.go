@@ -42,6 +42,8 @@ type Harness struct {
 func NewHarness(t *testing.T, n int) *Harness {
 	ns := make([]*raft.Server, n)
 	connected := make([]bool, n)
+	commitChans := make([]chan raft.CommitEntry, n)
+	commits := make([][]raft.CommitEntry, n)
 	ready := make(chan interface{})
 
 	// Create all Servers in this cluster, assign ids and peer ids.
@@ -49,11 +51,12 @@ func NewHarness(t *testing.T, n int) *Harness {
 		peerIds := make([]int, 0)
 		for p := 0; p < n; p++ {
 			if p != i {
-				peerIds = append(peerIds, int(p))
+				peerIds = append(peerIds, p)
 			}
 		}
 
-		ns[i] = raft.NewServer(int(i), peerIds, ready)
+		commitChans[i] = make(chan raft.CommitEntry)
+		ns[i] = raft.NewServer(i, peerIds, ready, commitChans[i])
 		ns[i].Serve()
 	}
 
@@ -61,21 +64,26 @@ func NewHarness(t *testing.T, n int) *Harness {
 	for i := 0; i < n; i++ {
 		for j := 0; j < n; j++ {
 			if i != j {
-				ns[i].ConnectToPeer(int(j), ns[j].GetListenAddr())
+				ns[i].ConnectToPeer(j, ns[j].GetListenAddr())
 			}
 		}
 		connected[i] = true
 	}
 	close(ready)
 
-	return &Harness{
-		cluster:   ns,
-		connected: connected,
-		n:         int(n),
-		t:         t,
+	h := &Harness{
+		cluster:     ns,
+		commitChans: commitChans,
+		commits:     commits,
+		connected:   connected,
+		n:           n,
+		t:           t,
 	}
+	for i := 0; i < n; i++ {
+		go h.collectCommits(i)
+	}
+	return h
 }
-
 // Shutdown shuts down all the servers in the harness and waits for them to
 // stop running.
 func (h *Harness) Shutdown() {
@@ -85,6 +93,10 @@ func (h *Harness) Shutdown() {
 	}
 	for i := int(0); i < h.n; i++ {
 		h.cluster[i].Shutdown()
+	}
+	for i := 0; i < h.n; i++ {
+		close(h.commitChans[i])
+		// 关闭 commitChan,否则collectCommits 会泄露
 	}
 }
 
@@ -225,6 +237,23 @@ func (h *Harness) CheckCommitted(cmd int) (nc int, index int) {
 	h.t.Errorf("cmd=%d not found in commits", cmd)
 	return -1, -1
 }
+
+func (h *Harness) CheckNotCommitted(cmd int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for i := 0; i < h.n; i++ {
+		if h.connected[i] {
+			for c := 0; c < len(h.commits[i]); c++ {
+				gotCmd := h.commits[i][c].Command.(int)
+				if gotCmd == cmd {
+					h.t.Errorf("found %d at commits[%d][%d], expected none", cmd, i, c)
+				}
+			}
+		}
+	}
+}
+
 func tlog(format string, a ...interface{}) {
 	format = "[TEST] " + format
 	log.Printf(format, a...)
@@ -232,4 +261,12 @@ func tlog(format string, a ...interface{}) {
 
 func SleepMs(n int) {
 	time.Sleep(time.Duration(n) * time.Millisecond)
+}
+func (h *Harness) collectCommits(i int) {
+	for c := range h.commitChans[i] {
+		h.mu.Lock()
+		tlog("collectCommits(%d) got %+v", i, c)
+		h.commits[i] = append(h.commits[i], c)
+		h.mu.Unlock()
+	}
 }
