@@ -30,11 +30,11 @@ type Server struct {
 
 	ready <-chan interface{}
 	quit  chan interface{}
-
+	commitChan chan <- CommitEntry
 	wg sync.WaitGroup
 }
 
-func NewServer(serverId int, peerIds []int, ready <-chan interface{}) *Server {
+func NewServer(serverId int, peerIds []int, ready <-chan interface{},commitChan chan <-CommitEntry) *Server {
 	return &Server{
 		mu:          sync.Mutex{},
 		serverId:    serverId,
@@ -43,13 +43,14 @@ func NewServer(serverId int, peerIds []int, ready <-chan interface{}) *Server {
 		ready:       ready,
 		quit:        make(chan interface{}),
 		wg:          sync.WaitGroup{},
+		commitChan :commitChan,
 	}
 }
 
 // 开始服务
 func (s *Server) Serve() {
 	s.mu.Lock()
-	s.Cm = NewConsensusModule(s.serverId, s.peerIds, s, s.ready)
+	s.Cm = NewConsensusModule(s.serverId, s.peerIds, s, s.ready,s.commitChan)
 
 	// 开启一个RPC服务
 	s.rpcServer = rpc.NewServer()

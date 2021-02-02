@@ -76,11 +76,12 @@ type ConsensusModule struct {
 
 	// 与客户端进行通信
 	newCommitReadyChan chan struct{}
+	commitChan         chan<- CommitEntry
 }
 
 const None int = -1
 
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := &ConsensusModule{
 		mu:                    sync.Mutex{},
 		id:                    id,
@@ -90,6 +91,12 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 		currentTerm:           0,    // 根据论文，初始化 0
 		voteFor:               None, //根据论文 初始化 None
 		HeartbeatTimeDuration: 50 * time.Millisecond,
+		nextIndex:             make(map[int]int),
+		matchIndex:            make(map[int]int),
+		lastApplied:           None,
+		commitIndex:           None,
+		newCommitReadyChan:    make(chan struct{}, 16),
+		commitChan:            commitChan,
 	}
 	go func() {
 		// 接收到一个ready信号，则选举计时器开始
@@ -101,6 +108,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 
 		cm.runElectionTimer()
 	}()
+	go cm.commitChanSender()
 	return cm
 }
 
@@ -122,6 +130,7 @@ func (cm *ConsensusModule) Stop() {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.state = Dead
+	close(cm.newCommitReadyChan) // 关闭newCommitReadyChan ,否则commitChanSender会泄露
 	cm.debugLog("becomes Dead")
 }
 
@@ -140,7 +149,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	// 生成一个选举超时时间
 	timeoutDuration := cm.electionTimeout()
 	cm.mu.Lock()
-	cm.debugLog("获得一个选举超时时间 %+v", cm.id, timeoutDuration)
+	cm.debugLog("获得一个选举超时时间 %v",timeoutDuration)
 	termStarted := cm.currentTerm // 记录选举计时器开始的任期，当计时器发现任期变化时，计时器退出
 	cm.mu.Unlock()
 
@@ -155,7 +164,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 			// 不是候选者，也不是跟随者
 			//  因此选举计时器，不需要
 			cm.mu.Unlock()
-			cm.debugLog("选举计时器退出 state ", cm.state)
+			cm.debugLog("选举计时器退出 state %s", cm.state.String())
 			return // 选举计时器退出
 		}
 
@@ -258,7 +267,11 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 func (cm *ConsensusModule) becomeLeader() {
 	cm.state = Leader
 	cm.debugLog("becomes Leader; term=%d, log=%v", cm.currentTerm, cm.log)
-
+	// 当一个领导人刚获得权力的时候，他初始化所有的 nextIndex 值为自己的最后一条日志的 index
+	for _, peerId := range cm.peerIds {
+		cm.nextIndex[peerId] = len(cm.log)
+		cm.matchIndex[peerId] = None
+	}
 	go func() {
 		// 心跳计时器
 		ticker := time.NewTicker(cm.HeartbeatTimeDuration)
@@ -340,7 +353,7 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 						// 统计相应成功的个数,如果日志被大多数应用,这Leader 更新commitIndex ,表示这一条日志被永久应用到状态机
 						savedCommitIndex := cm.commitIndex
 
-						for i := cm.commitIndex; i < len(cm.log); i++ {
+						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
 							// 从上一此应用到日志的索引开始统计
 							// 5.4.2 如果一个新的领导人要重新复制之前的任期里的日志时，它必须使用当前新的任期号
 							if cm.log[i].Term == cm.currentTerm {
@@ -358,7 +371,8 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 						}
 						if cm.commitIndex > savedCommitIndex {
 							// 表示有新的日志被应用,则通知客户端
-							cm.debugLog("有新的日志被应用到状态机.. ", cm.commitIndex)
+							cm.debugLog("Leader 有新的日志被应用到状态机.. ", cm.commitIndex)
+							cm.debugLog(" Leader all log %v",cm.log)
 							cm.newCommitReadyChan <- struct{}{}
 						}
 					} else {
@@ -456,15 +470,33 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 
 			// 寻找到一个和preLogIndex以及prevLogTerm一样的索引和任期的日志条目
 
-
-			// TODO
-
-
+			matchInsertIndex := args.PrevLogIndex + 1
+			newEntriesIndex := 0
+			for {
+				// 如果matchInsertIndex>=len(cm.log) 表示,log最新一条日志跟Leader 的 PrevLogIndex保持一致
+				// 如果 newEntriesIndex>len(args.Entries) 表示 没有找到一条跟Leader 的PrevLogIndex保持一致
+				if matchInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
+					break
+				}
+				// cm.log[matchInsertIndex].Term != args.Entries[newEntriesIndex].Term
+				// 表示一致性检查
+				//跟随者冲突的日志条目全部删除并且加上领导人的日志
+				if cm.log[matchInsertIndex].Term != args.Entries[newEntriesIndex].Term {
+					break
+				}
+				matchInsertIndex++
+				newEntriesIndex++
+			}
+			if newEntriesIndex < len(args.Entries) {
+				// 表示至少还有一条日志是 Leader 跟Follower 是不一致的,此时追加日志,删除后面Follower后面不一致的日志
+				cm.log = append(cm.log[:matchInsertIndex], args.Entries[newEntriesIndex:]...)
+			}
 			// 如果领导者的已知已经提交的最高的日志条目的索引 大于 接收者的已知已经提交的最高的日志条目的索引
 			//则把 接收者的已知已经提交的最高的日志条目的索引 重置为 领导者的已知已经提交的最高的日志条目的索引 或者是 上一个新条目的索引 取两者的最小值
 			if args.LeaderCommit > cm.commitIndex {
-				cm.commitIndex = logMin(args.LeaderCommit,len(cm.log)-1)
-				cm.debugLog("应用新的日志到状态机 commitIndex",cm.commitIndex)
+				cm.commitIndex = logMin(args.LeaderCommit, len(cm.log)-1)
+				cm.debugLog("Follower 应用新的日志到状态机 commitIndex %d", cm.commitIndex)
+				cm.debugLog("Follower all log %v",cm.log)
 				cm.newCommitReadyChan <- struct{}{}
 			}
 
@@ -491,17 +523,43 @@ func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 func (cm *ConsensusModule) Submit(command interface{}) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	cm.debugLog("Submit received command ... %d %d ", cm.state, command)
+	cm.debugLog("Submit received command ... %s %d ", cm.state.String(), command)
 	if cm.state == Leader {
 		// 日志只能在Leader提交
 		cm.log = append(cm.log, LogEntry{
 			Command: command,
 			Term:    cm.currentTerm,
 		})
-		cm.debugLog("Leader log... %v ", cm.log)
+		cm.debugLog("Leader all log... %v ", cm.log)
 		return true
 	}
 	return false
+}
+
+// commitChanSender 发送已经应用的消息到客户端
+func (cm *ConsensusModule) commitChanSender() {
+	for range cm.newCommitReadyChan {
+		// 接收消息准备好的信号,将已经应用的日志发送给客户端
+		cm.mu.Lock()
+		savedTerm := cm.currentTerm
+		savedLastApplied := cm.lastApplied
+
+		var entries []LogEntry
+
+		if cm.commitIndex > cm.lastApplied {
+			entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]
+			cm.lastApplied = cm.commitIndex
+		}
+		cm.mu.Unlock()
+		cm.debugLog("commitChanSender entries=%v savedLastApplied=%v", entries, savedLastApplied)
+		for i, entry := range entries {
+			cm.commitChan <- CommitEntry{
+				Command: entry.Command,
+				Index:   savedLastApplied + i + 1,
+				Term:    savedTerm,
+			}
+		}
+	}
 }
 
 func logMin(a, b int) int {
