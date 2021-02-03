@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"math/rand"
@@ -49,7 +51,8 @@ type ConsensusModule struct {
 
 	// rpc 服务
 	server *Server
-
+	// 持久化接口
+	storage Storage
 	// 论文描述
 	// Persistent Raft state on all servers
 	currentTerm int        // 当前任期
@@ -81,7 +84,7 @@ type ConsensusModule struct {
 
 const None int = -1
 
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := &ConsensusModule{
 		mu:                    sync.Mutex{},
 		id:                    id,
@@ -97,6 +100,10 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 		commitIndex:           None,
 		newCommitReadyChan:    make(chan struct{}, 16),
 		commitChan:            commitChan,
+		storage:               storage,
+	}
+	if cm.storage.HasData() {
+		cm.restoreFromStorage()
 	}
 	go func() {
 		// 接收到一个ready信号，则选举计时器开始
@@ -226,10 +233,10 @@ func (cm *ConsensusModule) startElection() {
 			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
 			cm.mu.Unlock()
 			args := RequestVoteArgs{
-				Term:        savedCurrentTerm,
-				CandidateId: cm.id,
-				LastLogTerm: savedLastLogTerm,//候选人最后日志条目的任期号
-				LastLogIndex: savedLastLogIndex,//候选人的最后日志条目的索引值
+				Term:         savedCurrentTerm,
+				CandidateId:  cm.id,
+				LastLogTerm:  savedLastLogTerm,  //候选人最后日志条目的任期号
+				LastLogIndex: savedLastLogIndex, //候选人的最后日志条目的索引值
 			}
 			var reply RequestVoteReply
 			cm.debugLog("发送 RequestVote to %d: %+v", peerId, args)
@@ -437,21 +444,22 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	canVote := args.Term == cm.currentTerm &&
 		(cm.voteFor == None || cm.voteFor == args.CandidateId) &&
 		((args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) ||
-		args.LastLogTerm > lastLogTerm)
+			args.LastLogTerm > lastLogTerm)
 	// (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) 索引是可以相同的,表示两边具有相同的日志
 	// 论文实现
 	if canVote {
 		// 可以正常投票
-		cm.debugLog("可以 %d 投票",args.CandidateId)
+		cm.debugLog("可以 %d 投票", args.CandidateId)
 		cm.voteFor = args.CandidateId // 投票
 		cm.electionTime = time.Now()  // 更新选举计时器
 		reply.VoteGranted = true      // 投票
 	} else {
-		cm.debugLog("不能对 %d 投票 ",args.CandidateId)
+		cm.debugLog("不能对 %d 投票 ", args.CandidateId)
 		reply.VoteGranted = false // 不能正常投票
 	}
 
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.debugLog("... RequestVote reply: %+v", reply)
 	return nil
 }
@@ -516,7 +524,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			}
 			if newEntriesIndex < len(args.Entries) {
 				// 表示至少还有一条日志是 Leader 跟Follower 是不一致的,此时追加日志,删除后面Follower后面不一致的日志
-				cm.debugLog("删除不匹配的日志  %v matchInsertIndex:%d newEntriesIndex:%d",cm.log[matchInsertIndex:],matchInsertIndex,newEntriesIndex)
+				cm.debugLog("删除不匹配的日志  %v matchInsertIndex:%d newEntriesIndex:%d", cm.log[matchInsertIndex:], matchInsertIndex, newEntriesIndex)
 				cm.log = append(cm.log[:matchInsertIndex], args.Entries[newEntriesIndex:]...)
 			}
 			// 如果领导者的已知已经提交的最高的日志条目的索引 大于 接收者的已知已经提交的最高的日志条目的索引
@@ -534,6 +542,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 	reply.Term = cm.currentTerm
 	cm.debugLog("AppendEntries reply: %+v", *reply)
+	cm.persistToStorage()
 	return nil
 }
 
@@ -558,6 +567,7 @@ func (cm *ConsensusModule) Submit(command interface{}) bool {
 			Command: command,
 			Term:    cm.currentTerm,
 		})
+		cm.persistToStorage()
 		cm.debugLog("Leader all log... %v ", cm.log)
 		return true
 	}
@@ -588,6 +598,60 @@ func (cm *ConsensusModule) commitChanSender() {
 			}
 		}
 	}
+}
+
+/*
+raft 持久化:
+
+currentTerm - the latest term this server has observed
+votedFor - the peer ID for whom this server voted in the latest term
+log - Raft log entries
+*/
+
+func (cm *ConsensusModule) restoreFromStorage() {
+	if temp, found := cm.storage.Get("currentTerm"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(temp))
+		if err := d.Decode(&cm.currentTerm); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("currentTerm 在存储中没有找到")
+	}
+	if temp, found := cm.storage.Get("voteFor"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(temp))
+		if err := d.Decode(&cm.voteFor); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("voteFor 在存储中没有找到")
+	}
+	if temp, found := cm.storage.Get("log"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(temp))
+		if err := d.Decode(&cm.log); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("log 在存储中没有找到")
+	}
+}
+
+func (cm *ConsensusModule) persistToStorage() {
+	var tempData bytes.Buffer
+	if err := gob.NewEncoder(&tempData).Encode(cm.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("currentTerm", tempData.Bytes())
+	tempData.Reset()
+	if err := gob.NewEncoder(&tempData).Encode(cm.voteFor); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("voteFor", tempData.Bytes())
+	tempData.Reset()
+	if err := gob.NewEncoder(&tempData).Encode(cm.log); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("log", tempData.Bytes())
+	tempData.Reset()
 }
 
 func logMin(a, b int) int {

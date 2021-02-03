@@ -19,8 +19,8 @@ type Server struct {
 	serverId int
 	peerIds  []int
 
-	Cm *ConsensusModule
-
+	Cm      *ConsensusModule
+	storage Storage
 	// rpc 服务
 	rpcServer *rpc.Server
 	listener  net.Listener
@@ -28,13 +28,13 @@ type Server struct {
 
 	peerClients map[int]*rpc.Client
 
-	ready <-chan interface{}
-	quit  chan interface{}
-	commitChan chan <- CommitEntry
-	wg sync.WaitGroup
+	ready      <-chan interface{}
+	quit       chan interface{}
+	commitChan chan<- CommitEntry
+	wg         sync.WaitGroup
 }
 
-func NewServer(serverId int, peerIds []int, ready <-chan interface{},commitChan chan <-CommitEntry) *Server {
+func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *Server {
 	return &Server{
 		mu:          sync.Mutex{},
 		serverId:    serverId,
@@ -43,24 +43,25 @@ func NewServer(serverId int, peerIds []int, ready <-chan interface{},commitChan 
 		ready:       ready,
 		quit:        make(chan interface{}),
 		wg:          sync.WaitGroup{},
-		commitChan :commitChan,
+		storage:     storage,
+		commitChan:  commitChan,
 	}
 }
 
 // 开始服务
 func (s *Server) Serve() {
 	s.mu.Lock()
-	s.Cm = NewConsensusModule(s.serverId, s.peerIds, s, s.ready,s.commitChan)
+	s.Cm = NewConsensusModule(s.serverId, s.peerIds, s,s.storage, s.ready, s.commitChan)
 
 	// 开启一个RPC服务
 	s.rpcServer = rpc.NewServer()
 
 	s.rpcProxy = &RPCProxy{cm: s.Cm}
 
-	s.rpcServer.RegisterName("ConsensusModule",s.rpcProxy)
+	s.rpcServer.RegisterName("ConsensusModule", s.rpcProxy)
 	var err error
 
-	s.listener,err = net.Listen("tcp",":0")
+	s.listener, err = net.Listen("tcp", ":0")
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -68,17 +69,16 @@ func (s *Server) Serve() {
 
 	s.mu.Unlock()
 
-
 	s.wg.Add(1)
 
 	go func() {
 		defer s.wg.Done()
 
 		for {
-			conn,err:=s.listener.Accept()
-			if err!=nil{
+			conn, err := s.listener.Accept()
+			if err != nil {
 				select {
-				case <- s.quit:
+				case <-s.quit:
 					return
 				default:
 					log.Fatal("accept error:", err)
@@ -106,7 +106,6 @@ func (s *Server) Call(id int, serviceMethod string, args interface{}, reply inte
 		return fmt.Errorf("call client %d after it's closed", id)
 	}
 }
-
 
 // DisconnectAll closes all the client connections to peers for this server.
 func (s *Server) DisconnectAll() {
@@ -159,8 +158,6 @@ func (s *Server) DisconnectPeer(peerId int) error {
 	return nil
 }
 
-
-
 // RPC 代理ConsensusModule ，这代理会代理 两个RPC方法
 type RPCProxy struct {
 	cm *ConsensusModule
@@ -184,7 +181,6 @@ func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) 
 	}
 	return rpp.cm.RequestVote(args, reply)
 }
-
 
 func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
@@ -211,8 +207,8 @@ type RequestVoteArgs struct {
 }
 
 type RequestVoteReply struct {
-	Term        int //自己的任期
-	VoteGranted bool   // 是否投票
+	Term        int  //自己的任期
+	VoteGranted bool // 是否投票
 }
 
 // 论文实现
